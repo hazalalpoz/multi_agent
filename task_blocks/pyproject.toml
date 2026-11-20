@@ -1,0 +1,40 @@
+[project]
+name = "task-blocks"
+version = "0.1.0"
+description = "Multi-agent emotional-support and factual assistant built on LangGraph, with LLM routing, a verification layer and long-term memory."
+readme = "README.md"
+authors = [
+    { name = "Alpoz Hazal Turkan", email = "lalprouz@gmail.com" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "arize-phoenix-otel>=0.17.3",
+    "fastapi>=0.115",
+    "httpx>=0.28",
+    "langchain>=1.4.6",
+    "langchain-core>=1.8.0",
+    "langchain-ollama>=1.1.0",
+    "langchain-openai>=1.7.4",
+    "langgraph>=1.2.16",
+    "langgraph-checkpoint-sqlite>=3.1.3",
+    "langmem>=0.0.30",
+    "openinference-instrumentation-langchain>=0.1.86",
+    "prometheus-client>=0.26.0",
+    "pydantic>=2.9",
+    "python-dotenv>=1.2.4",
+    "pyyaml>=6.0.2",
+    "uvicorn[standard]>=0.32",
+]
+
+[project.scripts]
+task-blocks = "task_blocks.cli:main"
+
+[dependency-groups]
+dev = [
+    "ipykernel>=7.4.0",
+    "pytest>=8.3.0",
+]
+
+[build-system]
+requires = ["uv_build>=0.13.1,<0.14.0"]
+build-backend = "uv_build"

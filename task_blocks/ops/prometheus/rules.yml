@@ -1,0 +1,138 @@
+# Alert rules.
+#
+# These are deliberately agent-specific. HTTP-level alerting would miss every
+# failure mode that matters here: the API returns 200 while the router
+# misclassifies, the verifier rejects every draft, or the free tier starts
+# throttling. Each rule below watches a decision, not a status code.
+#
+# Thresholds are starting points chosen from the Phase 3 runs (10-40s per turn
+# on CPU-only local inference), not from production data. Phase 5's eval runs
+# are what should tighten them.
+
+groups:
+  - name: availability
+    rules:
+      - alert: AppDown
+        expr: up{job="task-blocks-app"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "task-blocks app is not being scraped"
+          description: >-
+            Prometheus cannot scrape {{ $labels.instance }}. The API is down,
+            unreachable, or wedged.
+
+  - name: quality
+    rules:
+      # The headline quality signal: the share of turns the verifier rejects.
+      # A spike means the generating models have drifted, a prompt change
+      # backfired, or a provider is returning degraded output.
+      - alert: VerifierFailRateHigh
+        expr: |
+          sum(rate(verifier_verdicts_total{result="fail"}[10m]))
+            /
+          clamp_min(sum(rate(verifier_verdicts_total[10m])), 0.001)
+            > 0.3
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Verifier is rejecting over 30% of drafts"
+          description: >-
+            Rejection rate over the last 10 minutes exceeded 30%. Check
+            Phoenix traces for the rejection reasons before changing prompts.
+
+      # Reaching the fixed safe reply means both the first draft and the
+      # regeneration failed. The user got a canned message, so this is a
+      # user-visible failure even though the request succeeded.
+      - alert: SafeFallbackRateHigh
+        expr: |
+          sum(rate(agent_requests_total{outcome="safe_fallback"}[15m]))
+            /
+          clamp_min(sum(rate(agent_requests_total[15m])), 0.001)
+            > 0.05
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Over 5% of turns end in the fixed safe reply"
+          description: >-
+            Both the draft and its regeneration are failing verification for
+            more than 5% of turns.
+
+      # The router falling back to keyword detection means its structured
+      # output stopped parsing — usually a model or Ollama problem.
+      - alert: RouterFallbackActive
+        expr: sum(rate(fallback_total{reason="router_structured_output"}[10m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Router structured output is failing"
+          description: >-
+            The router is falling back to keyword-based routing, so every turn
+            is being classified by regex rather than by the model.
+
+  - name: latency
+    rules:
+      - alert: TurnLatencyP95High
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum(rate(agent_request_latency_seconds_bucket[10m])) by (le)
+          ) > 60
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "p95 turn latency above 60s"
+          description: >-
+            p95 is {{ $value | humanizeDuration }}. Expect this on CPU-only
+            local inference under load; investigate if it persists.
+
+  - name: dependencies
+    rules:
+      # Free-tier 429s are the most likely external failure, and the one that
+      # silently shifts traffic onto the fallback model.
+      - alert: RemoteModelErrorsHigh
+        expr: |
+          sum(rate(llm_calls_total{status="error"}[10m])) by (model)
+            /
+          clamp_min(sum(rate(llm_calls_total[10m])) by (model), 0.001)
+            > 0.2
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Model {{ $labels.model }} is failing over 20% of calls"
+          description: >-
+            Likely rate limiting (HTTP 429) or a provider outage. Transport
+            fallbacks absorb this until the fallback model is throttled too.
+
+      - alert: MemorySearchErrors
+        expr: sum(rate(memory_ops_total{status="error"}[10m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Long-term memory operations are failing"
+          description: >-
+            Retrieval or writes are erroring. Replies continue without memory,
+            so this degrades quality without failing requests.
+
+  - name: safety
+    rules:
+      # Not an error condition: an informational alert, because a sustained
+      # rise in crisis turns is something a human should know about.
+      - alert: CrisisDetectionRateUnusual
+        expr: sum(rate(crisis_detected_total[30m])) > 0.05
+        for: 15m
+        labels:
+          severity: info
+        annotations:
+          summary: "Sustained rise in crisis-flagged turns"
+          description: >-
+            More than 3 crisis detections per minute over 30 minutes. Verify
+            the detector is not misfiring, and that help resources are being
+            included.

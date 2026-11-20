@@ -1,0 +1,31 @@
+# Keep secrets and local state out of the build context entirely: anything
+# here cannot end up in an image layer by accident.
+.env
+.env.*
+!.env.example
+
+.venv/
+data/
+__pycache__/
+*.py[oc]
+*.egg-info/
+build/
+dist/
+wheels/
+
+.git/
+.gitignore
+.idea/
+.vscode/
+.DS_Store
+
+# Not needed at runtime: the image serves the API, it does not build reports
+# or run evals.
+docs/
+report/
+evals/
+tests/
+
+# Note: no blanket `*.md` rule. The agent's prompts, skills and SOUL.md are
+# Markdown and are loaded at runtime, so excluding Markdown would ship an
+# image that cannot build a system prompt.

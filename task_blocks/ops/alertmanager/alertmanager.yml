@@ -1,0 +1,43 @@
+# Alertmanager routing.
+#
+# Destination is a local webhook receiver that logs what it is sent (see the
+# `alert-webhook` service). Chosen over Telegram or email so the alerting path
+# is fully self-contained and demonstrable with no external accounts and no
+# credentials in the repo.
+#
+# To send alerts elsewhere, add a receiver here — `telegram_configs` with a
+# bot token from .env, or `email_configs` with SMTP settings — and point the
+# route at it. Nothing else in the stack changes.
+
+global:
+  resolve_timeout: 5m
+
+route:
+  receiver: local-webhook
+  group_by: ["alertname", "severity"]
+  # Wait briefly before the first notification so related alerts batch into one.
+  group_wait: 30s
+  group_interval: 5m
+  # Deliberately long: a quality regression does not need re-notifying every
+  # five minutes, and alert fatigue is the usual reason alerts get ignored.
+  repeat_interval: 4h
+  routes:
+    - matchers:
+        - severity = "critical"
+      receiver: local-webhook
+      group_wait: 10s
+      repeat_interval: 1h
+
+receivers:
+  - name: local-webhook
+    webhook_configs:
+      - url: http://alert-webhook:8080/alerts
+        send_resolved: true
+
+inhibit_rules:
+  # If the app is down, its quality and latency alerts are noise.
+  - source_matchers:
+      - alertname = "AppDown"
+    target_matchers:
+      - severity =~ "warning|info"
+    equal: ["stack"]

@@ -1,0 +1,15 @@
+apiVersion: 1
+
+providers:
+  - name: task-blocks
+    orgId: 1
+    folder: task-blocks
+    type: file
+    # Dashboards are provisioned from the repo, so the panels are version
+    # controlled rather than clicked together in the UI and lost on restart.
+    disableDeletion: false
+    allowUiUpdates: false
+    updateIntervalSeconds: 30
+    options:
+      path: /etc/grafana/dashboards
+      foldersFromFilesStructure: false

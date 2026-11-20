@@ -1,0 +1,370 @@
+# Deployment: the app and its local inference engine, isolated from each other
+# and from the network as far as each one's job allows.
+#
+# The isolation story, which `docs/DECISIONS.md` argues in full:
+#
+#   * `app` runs as a non-root user on a read-only root filesystem with every
+#     Linux capability dropped and no-new-privileges set. It needs egress,
+#     because the generating models are on OpenRouter.
+#   * `ollama` holds the local models and needs no internet at all once they
+#     are pulled, so it sits on an internal network with no egress. If a
+#     prompt injection ever gets a tool to talk to it, it has nowhere to send
+#     anything.
+#   * `ollama-init` is the one component that does need egress to registry.
+#     ollama.ai: it pulls the two models, then exits. It is on both networks
+#     and runs once.
+#
+# Ollama's port is deliberately not published: nothing outside the Compose
+# network needs it, and leaving 11434 unpublished means this stack cannot
+# collide with an Ollama you already run on the host.
+
+name: task-blocks
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: task-blocks:local
+    restart: unless-stopped
+    depends_on:
+      ollama:
+        condition: service_healthy
+    # Secrets come from .env at runtime and are never baked into the image.
+    env_file: .env
+    environment:
+      OLLAMA_BASE_URL: http://ollama:11434
+      DATA_DIR: /data
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      # Traces. Unset this and the app runs with metrics and logs only — a
+      # missing observability backend must never be an outage.
+      PHOENIX_COLLECTOR_ENDPOINT: http://phoenix:6006
+      PHOENIX_PROJECT_NAME: task-blocks
+    ports:
+      - "127.0.0.1:8000:8000"
+    networks:
+      # gw_priority forces the default route onto the egress network. Without
+      # it Docker picks the gateway by network name, `backend` sorts first, and
+      # a container attached to an internal network gets no route out — not
+      # even for DNS.
+      frontend:
+        gw_priority: 100
+      backend: {}
+    volumes:
+      - app-data:/data
+    user: "10001:10001"
+    read_only: true
+    tmpfs:
+      # The only writable paths besides /data. noexec and nosuid so a dropped
+      # file cannot be run.
+      - /tmp:rw,noexec,nosuid,size=64m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 1g
+        reservations:
+          memory: 256m
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 40s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  ollama:
+    image: ollama/ollama@sha256:910d0d8107b538fb0894e63163eb195de0cc7aefcbc666dc62d3b18f71124592
+    restart: unless-stopped
+    depends_on:
+      ollama-init:
+        condition: service_completed_successfully
+    # No ports published and no egress: reachable only from `app`, over the
+    # internal backend network. It serves models that are already in the
+    # volume; it never downloads anything itself.
+    networks:
+      - backend
+    volumes:
+      - ollama-models:/root/.ollama
+    environment:
+      # Keep the router/verifier model resident: it is called on every request,
+      # and a cold load adds seconds to a 0.7s classification.
+      OLLAMA_KEEP_ALIVE: "30m"
+      OLLAMA_MAX_LOADED_MODELS: "2"
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          # Both models are small, but inference here is CPU-only: Docker on
+          # macOS has no Metal access, and this host has no NVIDIA GPU. On a
+          # CUDA host, add the device reservation and expect a large speedup.
+          cpus: "4.0"
+          memory: 6g
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 30s
+      timeout: 10s
+      start_period: 20s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # One-shot: downloads the local models into the shared volume, then exits.
+  #
+  # This runs its own short-lived Ollama server rather than asking the
+  # long-running `ollama` service to pull, because `ollama pull` is only a
+  # client call: the *server* performs the download. The serving instance has
+  # no egress by design, so a pull proxied to it fails to resolve
+  # registry.ollama.ai — which is the isolation doing its job, not a bug.
+  #
+  # So the download happens here, on the egress network, writing into the same
+  # named volume. `ollama` then starts from that volume with no route out:
+  # "no internet egress after models are pulled", with the pull as a separate,
+  # explicit step.
+  ollama-init:
+    image: ollama/ollama@sha256:910d0d8107b538fb0894e63163eb195de0cc7aefcbc666dc62d3b18f71124592
+    environment:
+      ROUTER_MODEL: ${ROUTER_MODEL:-qwen3:1.7b}
+      VERIFIER_MODEL: ${VERIFIER_MODEL:-qwen3:1.7b}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-nomic-embed-text}
+    volumes:
+      - ollama-models:/root/.ollama
+    # Pulls whatever the configuration asks for, so changing a model in .env
+    # does not mean editing this file. Already-present models are a no-op, so
+    # restarting the stack does not re-download anything.
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -eu
+        ollama serve &
+        server_pid=$$!
+        for _ in $$(seq 1 60); do
+          if ollama list >/dev/null 2>&1; then break; fi
+          sleep 1
+        done
+        present="$$(ollama list 2>/dev/null || true)"
+        for model in "$${ROUTER_MODEL}" "$${VERIFIER_MODEL}" "$${EMBEDDING_MODEL}"; do
+          # Only pull what is missing. `ollama pull` contacts the registry even
+          # for a model that is already in the volume, so pulling
+          # unconditionally makes startup fail whenever the machine is offline,
+          # despite every model being cached. Matching on the bare name also
+          # covers the `:latest` suffix that `ollama list` prints.
+          name="$${model%%:*}"
+          if echo "$$present" | grep -q "^$${name}[: ]"; then
+            echo "already present: $${model}"
+            continue
+          fi
+          echo "pulling $${model}"
+          ollama pull "$${model}"
+        done
+        kill "$$server_pid"
+        wait "$$server_pid" 2>/dev/null || true
+        echo "local models ready"
+    networks:
+      # Egress only. It never talks to the serving instance, so it has no
+      # reason to be on the internal network.
+      - frontend
+    restart: "no"
+    security_opt:
+      - no-new-privileges:true
+
+  # --- observability -------------------------------------------------------
+  #
+  # All four sit on the `observability` network. Prometheus and Phoenix also
+  # join `frontend` because they need to reach the app — Prometheus to scrape
+  # /metrics, and the app to push spans to Phoenix. None of them is on
+  # `backend`: nothing in the monitoring stack has any business talking to the
+  # inference engine.
+  #
+  # UIs bind to 127.0.0.1 only. These services have no authentication worth
+  # the name in this configuration, and traces contain message content.
+
+  # Traces: every node, LLM call and tool call as a span.
+  phoenix:
+    image: arizephoenix/phoenix@sha256:09ec48906c054a27dd09a88c8e6bcc24fe89649d3ecc94d3a8ed394e21279b31
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:6006:6006"
+    environment:
+      PHOENIX_WORKING_DIR: /phoenix
+      # Recent Phoenix images enable auth by default, which makes the OTLP
+      # endpoint reject unauthenticated span pushes with 401 — silently, as far
+      # as the application is concerned. Disabled here because the UI is bound
+      # to 127.0.0.1 and no API key is stored in the repo. To enable it
+      # instead: set PHOENIX_ENABLE_AUTH=true with a PHOENIX_SECRET, create an
+      # API key in the UI, and pass it to the app as PHOENIX_API_KEY.
+      PHOENIX_ENABLE_AUTH: "false"
+    volumes:
+      - phoenix-data:/phoenix
+    networks:
+      - frontend
+      - observability
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  prometheus:
+    image: prom/prometheus@sha256:e04987641b57704f408e31f6373ba4138ecf27cb4a165d24aabb6c38fddd0f06
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=15d
+      - --web.enable-lifecycle
+    ports:
+      - "127.0.0.1:9090:9090"
+    volumes:
+      - ./ops/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./ops/prometheus/rules.yml:/etc/prometheus/rules.yml:ro
+      - prometheus-data:/prometheus
+    networks:
+      - frontend        # to scrape app:8000
+      - observability   # to reach alertmanager
+    user: "65534:65534"
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  grafana:
+    image: grafana/grafana@sha256:0615ec4fbd4072004b7d86b46ded63013a74b7d6eb1119273dd89e8fa25c13cf
+    restart: unless-stopped
+    depends_on:
+      - prometheus
+    ports:
+      - "127.0.0.1:3000:3000"
+    environment:
+      # Local-only stack bound to loopback. Set a real password, or disable
+      # anonymous access, before exposing this anywhere.
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-1234}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /etc/grafana/dashboards/task-blocks.json
+    volumes:
+      - ./ops/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./ops/grafana/dashboards:/etc/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    networks:
+      - observability
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  alertmanager:
+    image: prom/alertmanager@sha256:e638797febd034838eca8b98cdbd46f951e9bf7f178777aa8669167406a9946c
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --storage.path=/alertmanager
+    ports:
+      - "127.0.0.1:9093:9093"
+    volumes:
+      - ./ops/alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - alertmanager-data:/alertmanager
+    networks:
+      - observability
+    user: "65534:65534"
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          memory: 256m
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Alert destination: logs what Alertmanager sends it and serves the recent
+  # alerts at /alerts. Standard library only, so no image build is needed.
+  alert-webhook:
+    image: python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90
+    restart: unless-stopped
+    command: ["python", "/app/receiver.py"]
+    ports:
+      - "127.0.0.1:8081:8080"
+    volumes:
+      - ./ops/alert-webhook/receiver.py:/app/receiver.py:ro
+    networks:
+      - observability
+    user: "65534:65534"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          memory: 128m
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  frontend:
+    driver: bridge
+  backend:
+    driver: bridge
+    # No route off the host: this is what denies `ollama` egress.
+    internal: true
+  # The monitoring stack talks among itself here; it never joins `backend`, so
+  # nothing in it can reach the inference engine.
+  #
+  # Not `internal: true`: Grafana, Alertmanager and the webhook receiver
+  # publish UIs, and port publishing needs a network with a route to the host.
+  # They are bound to 127.0.0.1 instead, which is the control that actually
+  # matters for a local stack.
+  observability:
+    driver: bridge
+
+volumes:
+  # SQLite files for short-term checkpoints and long-term memories. A named
+  # volume, not a bind mount or an image layer: the data must outlive the
+  # container and must not be baked into the image.
+  app-data:
+  ollama-models:
+  phoenix-data:
+  prometheus-data:
+  grafana-data:
+  alertmanager-data:

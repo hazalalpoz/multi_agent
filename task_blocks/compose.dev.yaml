@@ -1,0 +1,28 @@
+# Development override. Use it only when running the CLI or the tests on the
+# host against the stack's Ollama:
+#
+#   docker compose -f compose.yaml -f compose.dev.yaml up -d
+#   uv run task-blocks
+#
+# The production file deliberately does not publish Ollama's port, so the
+# inference engine is reachable only from inside the Compose network. That is
+# the isolation property described in docs/DECISIONS.md, and this file breaks
+# it on purpose for local development: it binds the port to 127.0.0.1 so the
+# host can reach it, and nothing beyond the host can.
+#
+# Do not use this file for the deployment being assessed, and do not use it
+# while another Ollama is already listening on 11434.
+
+services:
+  ollama:
+    # Publishing a port requires a network with a route to the host, and in
+    # the production file `ollama` is only on the internal `backend` network.
+    # So this override also attaches it to `frontend`, which means that in dev
+    # mode the inference engine does have egress. That is precisely the
+    # property the deployment is designed to remove, which is why it lives
+    # here and not in compose.yaml.
+    networks:
+      backend: {}
+      frontend: {}
+    ports:
+      - "127.0.0.1:11434:11434"
